@@ -1,0 +1,723 @@
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import messagebox, ttk
+import sys, os
+import threading
+import time
+import queue
+from PIL import Image
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+import sqlite3
+from tkcalendar import DateEntry
+import datetime
+from fpdf import FPDF
+
+try:
+    import serial
+except ImportError:
+    serial = None
+
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
+
+COM_PORT = "COM5"
+BAUDRATE = 115200
+
+sidebar_bg_color = "#D4EBF8"
+BTN_WIDTH = 160
+BTN_HEIGHT = 44
+BTN_FONT = ("Arial", 16, "bold")
+BTN_ANCHOR = "w"
+BTN_SPACING = 12
+
+def setup_database():
+    conn = sqlite3.connect('hospital_doctor.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS hospitals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            address TEXT NOT NULL
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS doctors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS patients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            gender TEXT,
+            age INTEGER,
+            date TEXT,
+            time TEXT,
+            hospital_name TEXT,
+            doctor_name TEXT
+        )
+    ''')
+    # To support upgrading existing DB, try to add hospital_name and doctor_name columns if not exist
+    try:
+        c.execute("ALTER TABLE patients ADD COLUMN hospital_name TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    try:
+        c.execute("ALTER TABLE patients ADD COLUMN doctor_name TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    conn.commit()
+    conn.close()
+
+class SerialReader(threading.Thread):
+    def __init__(self, port, baudrate, data_queue, stop_event):
+        super().__init__()
+        self.port = port
+        self.baudrate = baudrate
+        self.data_queue = data_queue
+        self.stop_event = stop_event
+        self.ser = None
+
+    def run(self):
+        try:
+            if serial is None:
+                raise Exception("pyserial not installed")
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=1)
+            while not self.stop_event.is_set():
+                line = self.ser.readline()
+                if line:
+                    try:
+                        parts = line.decode(errors="ignore").strip().split(',')
+                        if len(parts) == 2:
+                            flow, volume = float(parts[0]), float(parts[1])
+                            self.data_queue.put((flow, volume))
+                        else:
+                            continue
+                    except Exception:
+                        continue
+            self.ser.close()
+        except Exception as e:
+            self.data_queue.put(('error', str(e)))
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("UROSON")
+        self.geometry("1260x600")
+        self.sidebar_bg_color = sidebar_bg_color
+
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0, fg_color=self.sidebar_bg_color)
+        self.sidebar_frame.grid(row=0, column=0, sticky="nswe")
+        for i in range(10):
+            self.sidebar_frame.grid_rowconfigure(i, weight=0)
+        self.sidebar_frame.grid_rowconfigure(7, weight=1)
+
+        logo_image = Image.open("logoedisonmedika.jpg")
+        self.logo_photo = ctk.CTkImage(light_image=logo_image, size=(160, 80))
+        logo_label = ctk.CTkLabel(self.sidebar_frame, image=self.logo_photo, text="")
+        logo_label.grid(row=0, column=0, pady=(20, BTN_SPACING+3), padx=20, sticky="w")
+
+        self.btn_start = ctk.CTkButton(
+            self.sidebar_frame, text="▶️  Start", font=BTN_FONT, width=BTN_WIDTH, height=BTN_HEIGHT,
+            anchor=BTN_ANCHOR, command=self.start_serial
+        )
+        self.btn_start.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, BTN_SPACING))
+        self.btn_stop = ctk.CTkButton(
+            self.sidebar_frame, text="⏹️  Stop", font=BTN_FONT, width=BTN_WIDTH, height=BTN_HEIGHT,
+            anchor=BTN_ANCHOR, command=self.stop_serial
+        )
+        self.btn_stop.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, BTN_SPACING))
+        self.btn_clear = ctk.CTkButton(
+            self.sidebar_frame, text="🧹  Clear", font=BTN_FONT, width=BTN_WIDTH, height=BTN_HEIGHT,
+            anchor=BTN_ANCHOR, command=self.clear_plot
+        )
+        self.btn_clear.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, BTN_SPACING))
+        self.btn_setting = ctk.CTkButton(
+            self.sidebar_frame, text="⚙️  Setting", font=BTN_FONT, width=BTN_WIDTH, height=BTN_HEIGHT,
+            anchor=BTN_ANCHOR, command=self.show_setting
+        )
+        self.btn_setting.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, BTN_SPACING))
+        self.btn_restart = ctk.CTkButton(
+            self.sidebar_frame, text="🔄  Restart", font=BTN_FONT, width=BTN_WIDTH, height=BTN_HEIGHT,
+            anchor=BTN_ANCHOR, command=self.restart
+        )
+        self.btn_restart.grid(row=8, column=0, sticky="ew", padx=20, pady=(0, BTN_SPACING))
+        self.btn_shutdown = ctk.CTkButton(
+            self.sidebar_frame, text="⏻  Shutdown", font=BTN_FONT, width=BTN_WIDTH, height=BTN_HEIGHT,
+            anchor=BTN_ANCHOR, command=self.on_close
+        )
+        self.btn_shutdown.grid(row=9, column=0, sticky="ew", padx=20, pady=(0, 18))
+
+        self.container = ctk.CTkFrame(self)
+        self.container.grid(row=0, column=1, sticky="nswe")
+        self.grid_columnconfigure(1, weight=1)
+
+        setup_database()  # Ensure DB ready before frames created
+
+        self.frames = {}
+        for F in (StartPage, SettingPage):
+            frame = F(self.container, self)
+            self.frames[F] = frame
+            frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.current_page = StartPage
+        self.show_start()
+
+        self.serial_thread = None
+        self.serial_stop_event = threading.Event()
+        self.data_queue = queue.Queue()
+
+    def show_start(self):
+        self.frames[StartPage].tkraise()
+        self.current_page = StartPage
+
+    def show_setting(self):
+        self.frames[SettingPage].refresh_hospital()
+        self.frames[SettingPage].refresh_doctor()
+        self.frames[SettingPage].tkraise()
+        self.current_page = SettingPage
+
+    def start_serial(self):
+        if self.current_page == SettingPage:
+            self.show_start()
+            return
+        self.stop_serial()
+        self.frames[StartPage].clear_plot()
+        self.serial_stop_event.clear()
+        self.serial_thread = SerialReader(COM_PORT, BAUDRATE, self.data_queue, self.serial_stop_event)
+        self.serial_thread.start()
+        self.after(100, self.update_plot)
+
+    def stop_serial(self):
+        if self.serial_thread:
+            self.serial_stop_event.set()
+            self.serial_thread = None
+
+    def clear_plot(self):
+        self.frames[StartPage].clear_plot()
+
+    def update_plot(self):
+        frame = self.frames[StartPage]
+        while not self.data_queue.empty():
+            val = self.data_queue.get()
+            if val and len(val) == 2 and val[0] != 'error':
+                flow, volume = val
+                frame.add_data(flow, volume)
+            elif val and val[0] == 'error':
+                messagebox.showerror("Serial Error", f"Failed to open serial port: {val[1]}")
+                self.stop_serial()
+        if self.serial_thread and not self.serial_stop_event.is_set():
+            self.after(100, self.update_plot)
+
+    def restart(self):
+        self.stop_serial()
+        python = sys.executable
+        os.execl(python, python, *sys.argv)
+
+    def on_close(self):
+        self.stop_serial()
+        self.destroy()
+
+class StartPage(ctk.CTkFrame):
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+
+        self.fig = Figure(figsize=(7,4), dpi=100)
+        self.ax1 = self.fig.add_subplot(211)
+        self.ax2 = self.fig.add_subplot(212)
+        self.ax1.set_xlim(0,60)
+        self.ax2.set_xlim(0,60)
+        self.ax1.set_ylim(0,300)
+        self.ax2.set_ylim(0,300)
+        self.ax2.set_xlabel("Waktu (s)")
+        self.ax1.set_ylabel("Flowmeter")
+        self.ax2.set_ylabel("Volume")
+        self.line1, = self.ax1.plot([], [], 'r-')
+        self.line2, = self.ax2.plot([], [], 'b-')
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=20, pady=10)
+        self.xdata = []
+        self.ydata1 = []
+        self.ydata2 = []
+        self.start_time = None
+
+        info = ctk.CTkFrame(self)
+        info.pack(fill="x", padx=18, pady=8)
+        self.lbl_flow = ctk.CTkLabel(info, text="Flowmeter: 0")
+        self.lbl_flow.pack(side="left", padx=10)
+        self.lbl_vol = ctk.CTkLabel(info, text="Volume: 0")
+        self.lbl_vol.pack(side="left", padx=10)
+        ctk.CTkButton(info, text="💾 Save", font=("Arial", 14, "bold"), width=110, height=34, anchor="w", command=self.save_data).pack(side="right", padx=10)
+        ctk.CTkButton(info, text="📄 Report", font=("Arial", 14, "bold"), width=110, height=34, anchor="w", command=self.report).pack(side="right", padx=10)
+
+    def add_data(self, flow, volume):
+        t = time.time()
+        if not self.start_time:
+            self.start_time = t
+        elapsed = t - self.start_time
+        self.xdata.append(elapsed)
+        self.ydata1.append(flow)
+        self.ydata2.append(volume)
+        while self.xdata and self.xdata[0] < elapsed-60:
+            self.xdata.pop(0)
+            self.ydata1.pop(0)
+            self.ydata2.pop(0)
+        self.line1.set_data(self.xdata, self.ydata1)
+        self.line2.set_data(self.xdata, self.ydata2)
+        self.ax1.set_xlim(max(0, elapsed-60), max(60, elapsed))
+        self.ax2.set_xlim(max(0, elapsed-60), max(60, elapsed))
+        self.canvas.draw_idle()
+        self.lbl_flow.configure(text=f"Flowmeter: {flow}")
+        self.lbl_vol.configure(text=f"Volume: {volume}")
+
+    def clear_plot(self):
+        self.xdata.clear()
+        self.ydata1.clear()
+        self.ydata2.clear()
+        self.start_time = None
+        self.line1.set_data([], [])
+        self.line2.set_data([], [])
+        self.ax1.set_xlim(0,60)
+        self.ax2.set_xlim(0,60)
+        self.canvas.draw_idle()
+        self.lbl_flow.configure(text="Flowmeter: 0")
+        self.lbl_vol.configure(text="Volume: 0")
+
+    def save_data(self):
+        # Popup window
+        win = tk.Toplevel(self)
+        win.title("Patient Information")
+        win.geometry("450x480")
+        win.grab_set()
+
+        frame = tk.Frame(win)
+        frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        # ID Patient
+        tk.Label(frame, text="ID Patient:").grid(row=0, column=0, sticky="w")
+        entry_id = tk.Entry(frame)
+        entry_id.grid(row=0, column=1, sticky="ew")
+
+        # First Name
+        tk.Label(frame, text="First Name:").grid(row=1, column=0, sticky="w")
+        entry_first = tk.Entry(frame)
+        entry_first.grid(row=1, column=1, sticky="ew")
+
+        # Last Name
+        tk.Label(frame, text="Last Name:").grid(row=2, column=0, sticky="w")
+        entry_last = tk.Entry(frame)
+        entry_last.grid(row=2, column=1, sticky="ew")
+
+        # Gender
+        tk.Label(frame, text="Gender:").grid(row=3, column=0, sticky="w")
+        gender_var = tk.StringVar(value="Male")
+        gender_menu = ttk.Combobox(frame, textvariable=gender_var, values=["Male", "Female"], state="readonly")
+        gender_menu.grid(row=3, column=1, sticky="ew")
+
+        # Age
+        tk.Label(frame, text="Age:").grid(row=4, column=0, sticky="w")
+        entry_age = tk.Entry(frame)
+        entry_age.grid(row=4, column=1, sticky="ew")
+
+        # Hospital Information (Dropdown)
+        tk.Label(frame, text="Hospital:").grid(row=5, column=0, sticky="w")
+        hospital_var = tk.StringVar()
+        hospital_menu = ttk.Combobox(frame, textvariable=hospital_var, state="readonly")
+        hospital_menu.grid(row=5, column=1, sticky="ew")
+
+        # Doctor Information (Dropdown)
+        tk.Label(frame, text="Doctor:").grid(row=6, column=0, sticky="w")
+        doctor_var = tk.StringVar()
+        doctor_menu = ttk.Combobox(frame, textvariable=doctor_var, state="readonly")
+        doctor_menu.grid(row=6, column=1, sticky="ew")
+
+        # Date
+        tk.Label(frame, text="Date:").grid(row=7, column=0, sticky="w")
+        date_var = tk.StringVar()
+        date_entry = DateEntry(frame, textvariable=date_var, date_pattern="yyyy-mm-dd")
+        date_entry.set_date(datetime.date.today())
+        date_entry.grid(row=7, column=1, sticky="ew")
+
+        # Time
+        tk.Label(frame, text="Time:").grid(row=8, column=0, sticky="w")
+        time_var = tk.StringVar()
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        time_var.set(now)
+        entry_time = tk.Entry(frame, textvariable=time_var, state="readonly")
+        entry_time.grid(row=8, column=1, sticky="ew")
+
+        # Load hospital and doctor data from DB to populate dropdowns
+        conn = sqlite3.connect('hospital_doctor.db')
+        c = conn.cursor()
+        c.execute("SELECT name FROM hospitals ORDER BY id")
+        hospitals = [row[0] for row in c.fetchall()]
+        c.execute("SELECT name FROM doctors ORDER BY id")
+        doctors = [row[0] for row in c.fetchall()]
+        conn.close()
+
+        hospital_menu['values'] = hospitals
+        doctor_menu['values'] = doctors
+        if hospitals:
+            hospital_var.set(hospitals[0])
+        else:
+            hospital_var.set('')
+
+        if doctors:
+            doctor_var.set(doctors[0])
+        else:
+            doctor_var.set('')
+
+        # Submit button
+        def submit():
+            pid = entry_id.get().strip()
+            first = entry_first.get().strip()
+            last = entry_last.get().strip()
+            gender = gender_var.get()
+            age = entry_age.get().strip()
+            hospital = hospital_var.get()
+            doctor = doctor_var.get()
+            date = date_var.get()
+            time_ = time_var.get()
+            if not (pid and first and last and age and hospital and doctor):
+                messagebox.showerror("Error", "All fields including hospital and doctor must be filled!")
+                return
+            try:
+                age_int = int(age)
+            except:
+                messagebox.showerror("Error", "Age must be a number!")
+                return
+            # Save to DB
+            conn = sqlite3.connect('hospital_doctor.db')
+            c = conn.cursor()
+            c.execute("INSERT INTO patients (patient_id, first_name, last_name, gender, age, date, time, hospital_name, doctor_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (pid, first, last, gender, age_int, date, time_, hospital, doctor))
+            conn.commit()
+            conn.close()
+            messagebox.showinfo("Success", "Patient data saved!")
+            win.destroy()
+
+        btn_submit = tk.Button(frame, text="Submit", command=submit, bg="#0078D7", fg="white", font=("Arial", 12, "bold"))
+        btn_submit.grid(row=9, column=0, columnspan=2, pady=20, sticky="ew")
+
+        for i in range(10):
+            frame.grid_rowconfigure(i, pad=8)
+        frame.grid_columnconfigure(1, weight=1)
+
+    def report(self):
+        # Popup window
+        win = tk.Toplevel(self)
+        win.title("Patient Report")
+        win.geometry("700x400")
+        win.grab_set()
+
+        # Frame history
+        frame_hist = tk.Frame(win)
+        frame_hist.pack(fill="both", expand=True, padx=10, pady=10)
+
+        columns = ("No", "Patient Name", "Date", "Time")
+        tree = ttk.Treeview(frame_hist, columns=columns, show="headings", height=10)
+        for col in columns:
+            tree.heading(col, text=col)
+        tree.column("No", width=40, anchor="center")
+        tree.column("Patient Name", width=200, anchor="center")
+        tree.column("Date", width=100, anchor="center")
+        tree.column("Time", width=100, anchor="center")
+        tree.pack(side="left", fill="both", expand=True)
+        sb = tk.Scrollbar(frame_hist, orient="vertical", command=tree.yview)
+        sb.pack(side="right", fill="y")
+        tree.config(yscrollcommand=sb.set)
+
+        # Load data from DB (newest top)
+        def load_data():
+            for item in tree.get_children():
+                tree.delete(item)
+            conn = sqlite3.connect('hospital_doctor.db')
+            c = conn.cursor()
+            c.execute("SELECT id, first_name, last_name, date, time FROM patients ORDER BY id DESC")
+            rows = c.fetchall()
+            conn.close()
+            for idx, (pid, first, last, date, time_) in enumerate(rows, start=1):
+                tree.insert("", "end", iid=pid, values=(idx, f"{first} {last}", date, time_))
+
+        load_data()
+
+        # Buttons frame
+        frame_btn = tk.Frame(win)
+        frame_btn.pack(fill="x", padx=10, pady=(0,10))
+
+        def generate_pdf_and_open():
+            try:
+                self.generate_pdf()
+                # Open the generated PDF
+                pdf_path = "patient_report.pdf"
+                if sys.platform == "win32":
+                    os.startfile(pdf_path)
+                elif sys.platform == "darwin":
+                    os.system(f"open '{pdf_path}'")
+                else:
+                    os.system(f"xdg-open '{pdf_path}'")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to generate or open PDF: {e}")
+
+        def print_pdf():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("Warning", "Select a patient first!")
+                return
+            # Dummy: show info
+            messagebox.showinfo("Print PDF", "Print PDF feature not implemented yet.")
+
+        def delete_patient():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("Warning", "Select a patient first!")
+                return
+            pid = sel[0]
+            if messagebox.askyesno("Delete", "Are you sure to delete this patient?"):
+                conn = sqlite3.connect('hospital_doctor.db')
+                c = conn.cursor()
+                c.execute("DELETE FROM patients WHERE id=?", (pid,))
+                conn.commit()
+                conn.close()
+                load_data()
+
+        def refresh():
+            load_data()
+
+        btn_view = tk.Button(frame_btn, text="View PDF", command=generate_pdf_and_open, width=12, bg="#0078D7", fg="white", font=("Arial", 11, "bold"))
+        btn_view.pack(side="left", padx=5)
+        btn_print = tk.Button(frame_btn, text="Print PDF", command=print_pdf, width=12, bg="#0078D7", fg="white", font=("Arial", 11, "bold"))
+        btn_print.pack(side="left", padx=5)
+        btn_delete = tk.Button(frame_btn, text="Delete", command=delete_patient, width=12, bg="#D70022", fg="white", font=("Arial", 11, "bold"))
+        btn_delete.pack(side="left", padx=5)
+        btn_refresh = tk.Button(frame_btn, text="Refresh", command=refresh, width=12, bg="#0078D7", fg="white", font=("Arial", 11, "bold"))
+        btn_refresh.pack(side="left", padx=5)
+
+    def generate_pdf(self):
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+
+        pdf.set_font("Arial", 'B', 16)
+        pdf.cell(0, 10, 'Patient Report', ln=True, align='C')
+
+        # Hospital Information
+        pdf.set_font("Arial", 'B', 14)
+        pdf.cell(0, 10, 'Hospital Information', ln=True)
+        pdf.set_font("Arial", '', 12)
+        conn = sqlite3.connect('hospital_doctor.db')
+        c = conn.cursor()
+        c.execute("SELECT name, address FROM hospitals ORDER BY id")
+        hospitals = c.fetchall()
+        for hosp in hospitals:
+            pdf.cell(0, 10, f"Name: {hosp[0]}, Address: {hosp[1]}", ln=True)
+        pdf.ln(5)
+
+        # Patient Information
+        pdf.set_font("Arial", 'B', 14)
+        pdf.cell(0, 10, 'Patient Information', ln=True)
+        pdf.set_font("Arial", '', 12)
+        c.execute("SELECT first_name, last_name, patient_id, gender, age, date, time, hospital_name, doctor_name FROM patients ORDER BY id DESC")
+        patients = c.fetchall()
+        for patient in patients:
+            pdf.cell(0, 10, f"ID: {patient[2]}, Name: {patient[0]} {patient[1]}, Gender: {patient[3]}, Age: {patient[4]}, Date: {patient[5]}, Time: {patient[6]}", ln=True)
+            pdf.cell(0, 10, f" Hospital: {patient[7]}, Doctor: {patient[8]}", ln=True)
+            pdf.ln(2)
+        pdf.ln(5)
+
+        # Doctor Information
+        pdf.set_font("Arial", 'B', 14)
+        pdf.cell(0, 10, 'Doctor Information', ln=True)
+        pdf.set_font("Arial", '', 12)
+        c.execute("SELECT name FROM doctors ORDER BY id")
+        doctors = c.fetchall()
+        for doctor in doctors:
+            pdf.cell(0, 10, f"Doctor: {doctor[0]}", ln=True)
+        pdf.ln(5)
+        conn.close()
+
+        # Save plots as images
+        flow_plot_path = "flowmeter_plot.png"
+        volume_plot_path = "volume_plot.png"
+        self.fig.savefig(flow_plot_path)
+
+        # Add Flowmeter Plot
+        pdf.set_font("Arial", 'B', 14)
+        pdf.cell(0, 10, 'Flowmeter and Volume Plots', ln=True)
+        pdf.image(flow_plot_path, x=10, w=190)
+        # We only have one figure with 2 subplots, so same image includes both
+
+        # Remove temporary plot image
+        if os.path.exists(flow_plot_path):
+            try:
+                os.remove(flow_plot_path)
+            except Exception:
+                pass
+
+        # Save the PDF
+        pdf.output("patient_report.pdf")
+
+class SettingPage(ctk.CTkFrame):
+    # ... existing code unchanged ...
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+
+        # HOSPITAL INFORMATION FRAME
+        frame_hosp = ctk.CTkFrame(self)
+        frame_hosp.pack(side="top", fill="x", padx=12, pady=(10, 4))
+
+        ctk.CTkLabel(frame_hosp, text="Hospital Information", font=("Arial", 16, "bold")).pack(pady=6)
+        ewrap = ctk.CTkFrame(frame_hosp, fg_color="transparent")
+        ewrap.pack(fill="x", padx=10, pady=3)
+        ctk.CTkLabel(ewrap, text="Name:", width=60).pack(side="left")
+        self.hosp_name = ctk.CTkEntry(ewrap)
+        self.hosp_name.pack(side="left", fill="x", expand=True, padx=(8,0))
+        ctk.CTkLabel(ewrap, text="Address:", width=74).pack(side="left", padx=(12, 0))
+        self.hosp_addr = ctk.CTkEntry(ewrap)
+        self.hosp_addr.pack(side="left", fill="x", expand=True, padx=(8,0))
+
+        hosp_btnwrap = ctk.CTkFrame(frame_hosp, fg_color="transparent")
+        hosp_btnwrap.pack(fill="x", padx=10, pady=(3,3))
+        btn_add_hosp = ctk.CTkButton(hosp_btnwrap, text="➕ Add", width=85, command=self.add_hospital, font=("Arial", 13, "bold"))
+        btn_add_hosp.pack(side="left", padx=(0,4))
+        btn_del_hosp = ctk.CTkButton(hosp_btnwrap, text="🗑️ Delete", width=93, command=self.delete_hospital, font=("Arial", 13, "bold"))
+        btn_del_hosp.pack(side="left", padx=(4,0))
+
+        ctk.CTkLabel(frame_hosp, text="History Hospital Data", font=("Arial", 13, "bold")).pack(anchor="w", padx=10)
+        hosp_table_frame = ctk.CTkFrame(frame_hosp)
+        hosp_table_frame.pack(fill="x", padx=10, pady=(0,10))
+        self.hosp_table = ttk.Treeview(hosp_table_frame, columns=("No", "Hospital Name", "Address"), show="headings", height=5)
+        self.hosp_table.heading("No", text="No")
+        self.hosp_table.heading("Hospital Name", text="Hospital Name")
+        self.hosp_table.heading("Address", text="Address")
+        self.hosp_table.column("No", width=35, anchor="center")
+        self.hosp_table.column("Hospital Name", width=170, anchor="center")
+        self.hosp_table.column("Address", width=170, anchor="center")
+        self.hosp_table.pack(side="left", fill="both", expand=True)
+        sb1 = tk.Scrollbar(hosp_table_frame, orient="vertical", command=self.hosp_table.yview)
+        sb1.pack(side="right", fill="y")
+        self.hosp_table.config(yscrollcommand=sb1.set)
+
+        # DOCTOR INFORMATION FRAME
+        frame_doc = ctk.CTkFrame(self)
+        frame_doc.pack(side="top", fill="x", padx=12, pady=(12, 8))
+
+        ctk.CTkLabel(frame_doc, text="Doctor Information", font=("Arial", 16, "bold")).pack(pady=6)
+        dwrap = ctk.CTkFrame(frame_doc, fg_color="transparent")
+        dwrap.pack(fill="x", padx=10, pady=3)
+        ctk.CTkLabel(dwrap, text="Name:", width=60).pack(side="left")
+        self.doc_name = ctk.CTkEntry(dwrap)
+        self.doc_name.pack(side="left", fill="x", expand=True, padx=(8,0))
+
+        doc_btnwrap = ctk.CTkFrame(frame_doc, fg_color="transparent")
+        doc_btnwrap.pack(fill="x", padx=10, pady=(3,3))
+        btn_add_doc = ctk.CTkButton(doc_btnwrap, text="➕ Add", width=85, command=self.add_doctor, font=("Arial", 13, "bold"))
+        btn_add_doc.pack(side="left", padx=(0,4))
+        btn_del_doc = ctk.CTkButton(doc_btnwrap, text="🗑️ Delete", width=93, command=self.delete_doctor, font=("Arial", 13, "bold"))
+        btn_del_doc.pack(side="left", padx=(4,0))
+
+        ctk.CTkLabel(frame_doc, text="History Doctor Data", font=("Arial", 13, "bold")).pack(anchor="w", padx=10)
+        doc_table_frame = ctk.CTkFrame(frame_doc)
+        doc_table_frame.pack(fill="x", padx=10, pady=(0,6))
+        self.doc_table = ttk.Treeview(doc_table_frame, columns=("No", "Doctor Name"), show="headings", height=5)
+        self.doc_table.heading("No", text="No")
+        self.doc_table.heading("Doctor Name", text="Doctor Name")
+        self.doc_table.column("No", width=35, anchor="center")
+        self.doc_table.column("Doctor Name", width=240, anchor="center")
+        self.doc_table.pack(side="left", fill="both", expand=True)
+        sb2 = tk.Scrollbar(doc_table_frame, orient="vertical", command=self.doc_table.yview)
+        sb2.pack(side="right", fill="y")
+        self.doc_table.config(yscrollcommand=sb2.set)
+
+        self.refresh_hospital()
+        self.refresh_doctor()
+
+    # HOSPITAL: add/delete/refresh
+    def add_hospital(self):
+        name = self.hosp_name.get().strip()
+        address = self.hosp_addr.get().strip()
+        if name and address:
+            conn = sqlite3.connect('hospital_doctor.db')
+            c = conn.cursor()
+            c.execute("INSERT INTO hospitals (name, address) VALUES (?, ?)", (name, address))
+            conn.commit()
+            conn.close()
+            self.refresh_hospital()
+            self.hosp_name.delete(0, "end")
+            self.hosp_addr.delete(0, "end")
+
+    def delete_hospital(self):
+        selected = self.hosp_table.selection()
+        if selected:
+            idx = self.hosp_table.index(selected[0])
+            conn = sqlite3.connect('hospital_doctor.db')
+            c = conn.cursor()
+            c.execute("SELECT id FROM hospitals ORDER BY id")
+            ids = [row[0] for row in c.fetchall()]
+            if idx < len(ids):
+                c.execute("DELETE FROM hospitals WHERE id=?", (ids[idx],))
+                conn.commit()
+            conn.close()
+            self.refresh_hospital()
+
+    def refresh_hospital(self):
+        for item in self.hosp_table.get_children():
+            self.hosp_table.delete(item)
+        conn = sqlite3.connect('hospital_doctor.db')
+        c = conn.cursor()
+        c.execute("SELECT name, address FROM hospitals ORDER BY id")
+        rows = c.fetchall()
+        conn.close()
+        for idx, (hosp, addr) in enumerate(rows, start=1):
+            self.hosp_table.insert("", "end", values=(idx, hosp, addr))
+
+    # DOCTOR: add/delete/refresh
+    def add_doctor(self):
+        name = self.doc_name.get().strip()
+        if name:
+            conn = sqlite3.connect('hospital_doctor.db')
+            c = conn.cursor()
+            c.execute("INSERT INTO doctors (name) VALUES (?)", (name,))
+            conn.commit()
+            conn.close()
+            self.refresh_doctor()
+            self.doc_name.delete(0, "end")
+
+    def delete_doctor(self):
+        selected = self.doc_table.selection()
+        if selected:
+            idx = self.doc_table.index(selected[0])
+            conn = sqlite3.connect('hospital_doctor.db')
+            c = conn.cursor()
+            c.execute("SELECT id FROM doctors ORDER BY id")
+            ids = [row[0] for row in c.fetchall()]
+            if idx < len(ids):
+                c.execute("DELETE FROM doctors WHERE id=?", (ids[idx],))
+                conn.commit()
+            conn.close()
+            self.refresh_doctor()
+
+    def refresh_doctor(self):
+        for item in self.doc_table.get_children():
+            self.doc_table.delete(item)
+        conn = sqlite3.connect('hospital_doctor.db')
+        c = conn.cursor()
+        c.execute("SELECT name FROM doctors ORDER BY id")
+        rows = c.fetchall()
+        conn.close()
+        for idx, (doc,) in enumerate(rows, start=1):
+            self.doc_table.insert("", "end", values=(idx, doc))
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
+
